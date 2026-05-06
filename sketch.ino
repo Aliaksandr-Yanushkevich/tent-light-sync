@@ -3,38 +3,58 @@
 #include <math.h>
 
 // ================== PINS ==================
-#define PIN_PWM     4
-#define PIN_DETECT  5
+#define PIN_PWM 4   // GPIO4 -> 100-220Ω -> Gate MOSFET
 
 // ================== PWM ==================
-#define PWM_FREQ    1000
-#define PWM_RES     10
-#define PWM_MAX     ((1 << PWM_RES) - 1)
+#define PWM_FREQ 1000
+#define PWM_RES  10
+#define PWM_MAX  ((1 << PWM_RES) - 1)
 
-// ================== BREATH ==================
+// ================== LIGHT SETTINGS ==================
 #define MODE_BREATH 1
 
-// Яркость 0..1023
-#define DEFAULT_MIN_BRIGHTNESS 80
-#define DEFAULT_MAX_BRIGHTNESS 400
-#define DEFAULT_PERIOD_MS      10000
+#define DEFAULT_MIN_BRIGHTNESS 80    // ~8%
+#define DEFAULT_MAX_BRIGHTNESS 400   // ~39%
+#define DEFAULT_PERIOD_MS      10000 // 10 sec
 
-// ================== ESP-NOW ==================
-uint8_t broadcastAddress[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+// ================== TIMING ==================
+#define MASTER_SYNC_INTERVAL_MS 3000
+#define MASTER_TIMEOUT_MS       30000
 
+// ================== PACKET ==================
 typedef struct {
   uint8_t version;
   uint8_t mode;
+
+  uint8_t master_mac[6];
+
   uint16_t period_ms;
   uint16_t min_brightness;
   uint16_t max_brightness;
-  uint32_t master_time;
+
+  uint32_t elapsed_ms;
   uint32_t sequence;
 } SyncPacket;
+
+// ================== GLOBALS ==================
+uint8_t ownMac[6];
+uint8_t currentMasterMac[6];
+
+uint8_t broadcastAddress[6] = {
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+bool isMaster = false;
+
+uint32_t localStartTime = 0;
+uint32_t lastSyncRxTime = 0;
+uint32_t lastSyncTxTime = 0;
+uint32_t sequenceCounter = 0;
 
 SyncPacket current = {
   1,
   MODE_BREATH,
+  {0, 0, 0, 0, 0, 0},
   DEFAULT_PERIOD_MS,
   DEFAULT_MIN_BRIGHTNESS,
   DEFAULT_MAX_BRIGHTNESS,
@@ -42,18 +62,28 @@ SyncPacket current = {
   0
 };
 
-// ================== STATE ==================
-bool isMaster = false;
-bool wasConnected = false;
+// ================== UTILS ==================
+int compareMac(const uint8_t *a, const uint8_t *b) {
+  for (int i = 0; i < 6; i++) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return 0;
+}
 
-uint32_t localStartTime = 0;
-uint32_t lastSyncTime = 0;
-uint32_t lastSendTime = 0;
-uint32_t sequenceCounter = 0;
+void copyMac(uint8_t *dst, const uint8_t *src) {
+  memcpy(dst, src, 6);
+}
 
-// ================== LIGHT ==================
+void printMac(const uint8_t *mac) {
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] < 16) Serial.print("0");
+    Serial.print(mac[i], HEX);
+    if (i < 5) Serial.print(":");
+  }
+}
+
 void lightOff() {
-  // Важно: НЕ использовать pinMode/digitalWrite на PWM-пине после ledcAttach()
   ledcWrite(PIN_PWM, 0);
 }
 
@@ -62,12 +92,15 @@ void setBrightness(uint16_t value) {
   ledcWrite(PIN_PWM, value);
 }
 
+// ================== BREATH ==================
 void updateBreath() {
-  if (current.period_ms == 0) current.period_ms = DEFAULT_PERIOD_MS;
+  if (current.period_ms == 0) {
+    current.period_ms = DEFAULT_PERIOD_MS;
+  }
 
   uint32_t t = millis() - localStartTime;
-
   float phase = (float)(t % current.period_ms) / current.period_ms;
+
   float s = (sin(phase * 2.0 * PI - PI / 2.0) + 1.0) / 2.0;
 
   uint16_t brightness =
@@ -75,6 +108,35 @@ void updateBreath() {
     s * (current.max_brightness - current.min_brightness);
 
   setBrightness(brightness);
+}
+
+// ================== ROLE ==================
+void becomeMaster() {
+  isMaster = true;
+  copyMac(currentMasterMac, ownMac);
+  copyMac(current.master_mac, ownMac);
+
+  localStartTime = millis();
+  lastSyncTxTime = 0;
+
+  Serial.print("ROLE: MASTER, MAC=");
+  printMac(ownMac);
+  Serial.println();
+}
+
+void becomeSlave(const SyncPacket &incoming) {
+  isMaster = false;
+
+  current = incoming;
+  copyMac(currentMasterMac, incoming.master_mac);
+
+  lastSyncRxTime = millis();
+  localStartTime = millis() - incoming.elapsed_ms;
+
+  Serial.print("ROLE: SLAVE, MASTER=");
+  printMac(currentMasterMac);
+  Serial.print(" seq=");
+  Serial.println(current.sequence);
 }
 
 // ================== ESP-NOW RECEIVE ==================
@@ -87,16 +149,42 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (incoming.version != 1) return;
   if (incoming.mode != MODE_BREATH) return;
 
-  current = incoming;
+  if (compareMac(incoming.master_mac, ownMac) == 0 && isMaster) return;
 
-  isMaster = false;
-  lastSyncTime = millis();
+  int cmp = compareMac(incoming.master_mac, currentMasterMac);
 
-  // Синхронизация фазы дыхания
-  localStartTime = millis() - current.master_time;
+  if (cmp < 0) {
+    becomeSlave(incoming);
+    return;
+  }
 
-  Serial.print("SYNC RX seq=");
-  Serial.println(current.sequence);
+  if (cmp == 0 && !isMaster) {
+    becomeSlave(incoming);
+    return;
+  }
+
+}
+
+// ================== ESP-NOW SEND ==================
+void sendSync() {
+  copyMac(current.master_mac, ownMac);
+
+  current.elapsed_ms = millis() - localStartTime;
+  current.sequence = sequenceCounter++;
+
+  esp_err_t result = esp_now_send(
+    broadcastAddress,
+    (uint8_t*)&current,
+    sizeof(current)
+  );
+
+  if (result == ESP_OK) {
+    Serial.print("SYNC TX seq=");
+    Serial.println(current.sequence);
+  } else {
+    Serial.print("SYNC FAIL code=");
+    Serial.println(result);
+  }
 }
 
 // ================== ESP-NOW INIT ==================
@@ -104,8 +192,11 @@ void initESPNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
+  WiFi.macAddress(ownMac);
+
+  Serial.print("OWN MAC: ");
+  printMac(ownMac);
+  Serial.println();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -126,104 +217,36 @@ void initESPNow() {
   }
 }
 
-// ================== ESP-NOW SEND ==================
-void sendSync() {
-  current.master_time = millis() - localStartTime;
-  current.sequence = sequenceCounter++;
-
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t*)&current, sizeof(current));
-
-  if (result == ESP_OK) {
-    Serial.print("SYNC TX seq=");
-    Serial.println(current.sequence);
-  } else {
-    Serial.print("SYNC FAIL code=");
-    Serial.println(result);
-  }
-}
-
-// ================== ROLE ==================
-void becomeMaster() {
-  isMaster = true;
-  localStartTime = millis();
-  lastSendTime = 0;
-
-  Serial.println("ROLE: MASTER");
-}
-
-void listenForMaster() {
-  Serial.println("Listening for master 3 sec...");
-
-  uint32_t start = millis();
-  while (millis() - start < 3000) {
-    delay(10);
-  }
-
-  if (lastSyncTime == 0) {
-    becomeMaster();
-  } else {
-    isMaster = false;
-    Serial.println("ROLE: SLAVE");
-  }
-}
-
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
-  Serial.println("=== tent-light-sync v1 ===");
-
-  pinMode(PIN_DETECT, INPUT_PULLUP);
+  Serial.println("=== tent-light-sync v1 final ===");
 
   ledcAttach(PIN_PWM, PWM_FREQ, PWM_RES);
   lightOff();
 
   initESPNow();
 
-  if (digitalRead(PIN_DETECT) == LOW) {
-    wasConnected = true;
-    Serial.println("DETECT: connected");
-    listenForMaster();
-  } else {
-    wasConnected = false;
-    Serial.println("DETECT: not connected, light OFF");
-    lightOff();
-  }
+  becomeMaster();
+
+  Serial.println("Setup complete");
 }
 
 // ================== LOOP ==================
 void loop() {
-  bool connected = digitalRead(PIN_DETECT) == LOW;
-
-  // Разъём отключён
-  if (!connected) {
-    lightOff();
-    wasConnected = false;
-    delay(50);
-    return;
-  }
-
-  // Разъём только что подключили
-  if (connected && !wasConnected) {
-    wasConnected = true;
-    lastSyncTime = 0;
-    listenForMaster();
-  }
-
-  // Если slave потерял master
-  if (!isMaster && millis() - lastSyncTime > 30000) {
-    Serial.println("MASTER LOST");
+  if (!isMaster && millis() - lastSyncRxTime > MASTER_TIMEOUT_MS) {
+    Serial.println("MASTER TIMEOUT");
     becomeMaster();
   }
 
   updateBreath();
 
-  // Master шлёт sync
-  if (isMaster && millis() - lastSendTime > 10000) {
+  if (isMaster && millis() - lastSyncTxTime > MASTER_SYNC_INTERVAL_MS) {
     sendSync();
-    lastSendTime = millis();
+    lastSyncTxTime = millis();
   }
 
   delay(10);
